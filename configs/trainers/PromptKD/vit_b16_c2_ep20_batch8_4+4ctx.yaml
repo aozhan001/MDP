@@ -1,0 +1,78 @@
+# PromptSRC: Prompting with Self-regularizing constraints
+DATALOADER:
+  TRAIN_X:
+    BATCH_SIZE: 8
+  TEST:
+    BATCH_SIZE: 100
+  NUM_WORKERS: 8
+
+INPUT:
+  SIZE: (224, 224)
+  INTERPOLATION: "bicubic"
+  PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
+  PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]
+  TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
+
+OPTIM:
+  NAME: "sgd"
+  LR: 0.005
+  MAX_EPOCH: 20
+  LR_SCHEDULER: "cosine"
+  WARMUP_EPOCH: 1
+  WARMUP_TYPE: "constant"
+  WARMUP_CONS_LR: 1e-5
+
+TRAIN:
+  PRINT_FREQ: 20
+
+MODEL:
+  BACKBONE:
+    NAME: "ViT-B/16"
+
+TEST:
+  FINAL_MODEL: "best_val"
+  NO_TEST: False
+
+
+TRAINER:
+  PROMPTKD:
+    N_CTX_VISION: 4
+    N_CTX_TEXT: 4
+    CTX_INIT: "a photo of a"
+    PREC: "fp16"
+    PROMPT_DEPTH_VISION: 9
+    PROMPT_DEPTH_TEXT: 9
+    TEACHER_NAME: "ViT-L/14"
+    PROJECT_LAYER: 2
+    CE_WEIGHT: 0.0
+    KD_WEIGHT: 1.0
+
+    USE_MULTI_TEMPLATE_TEXT: True
+    MTP_ALPHA: 0.2  #0.2
+    MTP_TEMPLATE_SET: "auto"
+    MTP_CUSTOM_TEMPLATES: ""
+    MTP_NORMALIZE_EACH_TEMPLATE: True
+    MTP_CACHE_TEXT_FEATURES: True
+    MTP_DEBUG: False
+    TEXT_CALIBRATION_DIAGNOSE: False
+    TEXT_CALIBRATION_DIAG_SPLIT: "val"
+    TEXT_CALIBRATION_DIAG_FILENAME: "text_calibration_diagnostics.json"
+
+    DVP_ENABLE: True
+    DVP_ALPHA: 0.2   #0.2
+    DVP_CACHE: True 
+    DVP_RECOMPUTE: True
+    DVP_CACHE_DIR: "dvp_cache"
+    DVP_EPS: 1e-6
+    DVP_MIN_MASS: 1e-4
+    DVP_HARD: False
+    DVP_TOPK: 0
+
+    PRIOR_CORRECT: True
+    PRIOR_GAMMA: 0.25   #0.25
+    PRIOR_EPS: 1e-6
+    PRIOR_TEMPERATURE: 1.0
+    PRIOR_CACHE: True
+    PRIOR_CACHE_DIR: "teacher_prior_cache"
+    PRIOR_RECOMPUTE: True
+    PRIOR_PRINT_TOPK: 10
