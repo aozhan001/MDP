@@ -47,7 +47,7 @@ TRAINER:
     CE_WEIGHT: 0.0
     KD_WEIGHT: 1.0
 
-    USE_MULTI_TEMPLATE_TEXT: True
+    USE_MULTI_TEMPLATE_TEXT: False
     MTP_ALPHA: 0.2  #0.2
     MTP_TEMPLATE_SET: "auto"
     MTP_CUSTOM_TEMPLATES: ""
@@ -76,3 +76,19 @@ TRAINER:
     PRIOR_CACHE_DIR: "teacher_prior_cache"
     PRIOR_RECOMPUTE: True
     PRIOR_PRINT_TOPK: 10
+
+    SNS_ENABLE: True
+    SNS_RHO: 0.5
+    SNS_RANK: 4
+    SNS_PCA_RANK: 32
+    SNS_SEMANTIC_RANK: 0
+    SNS_MAX_SAMPLES: 8192
+    SNS_CENTER: True
+    SNS_PCA_NITER: 4
+    SNS_CACHE: True
+    SNS_RECOMPUTE: False
+    SNS_CACHE_DIR: sns_cache
+    SNS_EPS: 1.0e-6
+    SNS_STRICT: True
+    SNS_DEBUG: True
+    SNS_DIAG_FILENAME: sns_diagnostics.json
