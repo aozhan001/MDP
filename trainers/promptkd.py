@@ -22,8 +22,6 @@ from .imagenet_templates import IMAGENET_TEMPLATES, IMAGENET_TEMPLATES_SELECT
 _tokenizer = _Tokenizer()
 
 DVP_CACHE_VERSION = "v2"
-SNS_CACHE_VERSION = "v1"
-PRIOR_CACHE_VERSION = "v2_sns"
 
 DATASET_CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -307,43 +305,6 @@ class PromptKD(TrainerX):
     def _sanitize_cache_token(self, value):
         return str(value).replace("/", "-").replace("\\", "-").replace(" ", "")
 
-    def _metadata_matches(self, cached, expected):
-        if not isinstance(cached, dict):
-            return False, "metadata is missing"
-
-        for key, expected_value in expected.items():
-            if key not in cached:
-                return False, f"missing metadata key '{key}'"
-
-            cached_value = cached[key]
-            if isinstance(expected_value, float):
-                try:
-                    cached_float = float(cached_value)
-                except (TypeError, ValueError):
-                    return False, f"metadata key '{key}' is not numeric"
-                if not math.isclose(cached_float, expected_value, rel_tol=1e-12, abs_tol=1e-12):
-                    return False, (
-                        f"metadata key '{key}' mismatch: "
-                        f"cached={cached_value}, expected={expected_value}"
-                    )
-            else:
-                if cached_value != expected_value:
-                    return False, (
-                        f"metadata key '{key}' mismatch: "
-                        f"cached={cached_value}, expected={expected_value}"
-                    )
-
-        return True, ""
-
-    def _resolve_relative_cache_dir(self, cache_root, anchor_output_parent=True):
-        if osp.isabs(cache_root):
-            return cache_root
-        if anchor_output_parent:
-            output_dir = self.cfg.OUTPUT_DIR if self.cfg.OUTPUT_DIR else "."
-            cache_parent = osp.dirname(osp.abspath(output_dir))
-            return osp.join(cache_parent, cache_root)
-        return cache_root
-
     def get_current_classnames(self):
         if hasattr(self, "dm") and hasattr(self.dm, "dataset") and hasattr(self.dm.dataset, "classnames"):
             classnames = self.dm.dataset.classnames
@@ -597,87 +558,12 @@ class PromptKD(TrainerX):
         class_prior = class_prior / class_prior.sum()
         return class_prior
 
-    def _get_prior_cache_metadata(self):
-        prior_cfg = self.cfg.TRAINER.PROMPTKD
-        return {
-            "cache_version": PRIOR_CACHE_VERSION,
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "seed": int(self.cfg.SEED),
-            "teacher": str(prior_cfg.TEACHER_NAME),
-            "n_cls": int(self.n_cls),
-            "prior_temperature": float(self.prior_temperature),
-            "dvp_enable": bool(prior_cfg.DVP_ENABLE),
-            "dvp_alpha": float(prior_cfg.DVP_ALPHA),
-            "dvp_hard": bool(prior_cfg.DVP_HARD),
-            "dvp_topk": int(prior_cfg.DVP_TOPK),
-            "dvp_min_mass": float(prior_cfg.DVP_MIN_MASS),
-            "use_multi_template_text": bool(prior_cfg.USE_MULTI_TEMPLATE_TEXT),
-            "mtp_alpha": float(prior_cfg.MTP_ALPHA),
-            "sns_enable": bool(prior_cfg.SNS_ENABLE),
-            "sns_rank": int(prior_cfg.SNS_RANK),
-            "sns_rho": float(prior_cfg.SNS_RHO),
-            "sns_pca_rank": int(prior_cfg.SNS_PCA_RANK),
-            "sns_semantic_rank": int(prior_cfg.SNS_SEMANTIC_RANK),
-            "sns_max_samples": int(prior_cfg.SNS_MAX_SAMPLES),
-            "sns_center": bool(prior_cfg.SNS_CENTER),
-            "sns_pca_niter": int(prior_cfg.SNS_PCA_NITER),
-            "classnames": list(self.classnames),
-        }
-
     def _get_prior_cache_path(self):
-        metadata = self._get_prior_cache_metadata()
-        token_items = [
-            ("prior", metadata["cache_version"]),
-            ("ds", metadata["dataset"]),
-            ("modal", metadata["modal"]),
-            ("seed", metadata["seed"]),
-            ("teacher", metadata["teacher"]),
-            ("ncls", metadata["n_cls"]),
-            ("temp", metadata["prior_temperature"]),
-            ("dvp", metadata["dvp_enable"]),
-            ("a", metadata["dvp_alpha"]),
-            ("hard", metadata["dvp_hard"]),
-            ("topk", metadata["dvp_topk"]),
-            ("mtp", metadata["use_multi_template_text"]),
-            ("mtpa", metadata["mtp_alpha"]),
-            ("sns", metadata["sns_enable"]),
-            ("r", metadata["sns_rank"]),
-            ("rho", metadata["sns_rho"]),
-            ("pca", metadata["sns_pca_rank"]),
-            ("sem", metadata["sns_semantic_rank"]),
-            ("max", metadata["sns_max_samples"]),
-            ("center", metadata["sns_center"]),
-            ("niter", metadata["sns_pca_niter"]),
-        ]
-        cache_name = "_".join(
-            f"{key}{self._sanitize_cache_token(value)}"
-            for key, value in token_items
-        ) + ".pth"
+        cache_name = (
+            f"{self.cfg.TRAINER.MODAL}_{self.cfg.DATASET.NAME}_seed{self.cfg.SEED}"
+            f"_ncls{self.n_cls}_temp{self.prior_temperature}.pth"
+        )
         return osp.join(self.cfg.TRAINER.PROMPTKD.PRIOR_CACHE_DIR, cache_name)
-
-    def _validate_prior_cache(self, cache):
-        if not isinstance(cache, dict):
-            return False, "prior cache is not a metadata dictionary"
-
-        expected = self._get_prior_cache_metadata()
-        cached_metadata = cache.get("metadata", None)
-        matched, reason = self._metadata_matches(cached_metadata, expected)
-        if not matched:
-            return False, reason
-
-        cached_prior = cache.get("class_prior", None)
-        if cached_prior is None:
-            return False, "class_prior is missing"
-        cached_prior = cached_prior.flatten()
-        if cached_prior.shape[0] != self.n_cls:
-            return False, (
-                f"class_prior shape mismatch: got {cached_prior.shape[0]}, "
-                f"expected {self.n_cls}"
-            )
-        if not torch.isfinite(cached_prior.float()).all():
-            return False, "class_prior contains NaN or Inf"
-        return True, ""
 
     def _log_teacher_class_prior(self, class_prior):
         class_prior = class_prior.detach().float().cpu()
@@ -863,513 +749,27 @@ class PromptKD(TrainerX):
         )
         return osp.join(cache_dir, filename)
 
-    def _infer_teacher_feature_dim(self):
-        for features in [self.dvp_base_text_features, self.dvp_text_features]:
-            if features is not None:
-                return int(features.shape[-1])
-
-        text_projection = getattr(self.model_teacher.text_encoder, "text_projection", None)
-        if text_projection is not None:
-            return int(text_projection.shape[-1])
-
-        raise RuntimeError("Unable to infer teacher feature dimension for SNS cache path")
-
-    def _get_sns_cache_metadata(self, feature_dim):
-        sns_cfg = self.cfg.TRAINER.PROMPTKD
-        return {
-            "cache_version": SNS_CACHE_VERSION,
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "seed": int(self.cfg.SEED),
-            "teacher": str(sns_cfg.TEACHER_NAME),
-            "classnames": list(self.classnames),
-            "n_cls": int(self.n_cls),
-            "feature_dim": int(feature_dim),
-            "sns_rank": int(sns_cfg.SNS_RANK),
-            "sns_pca_rank": int(sns_cfg.SNS_PCA_RANK),
-            "sns_semantic_rank": int(sns_cfg.SNS_SEMANTIC_RANK),
-            "sns_max_samples": int(sns_cfg.SNS_MAX_SAMPLES),
-            "sns_center": bool(sns_cfg.SNS_CENTER),
-            "sns_pca_niter": int(sns_cfg.SNS_PCA_NITER),
-        }
-
-    def _resolve_sns_cache_path(self, feature_dim=None):
-        sns_cfg = self.cfg.TRAINER.PROMPTKD
-        feature_dim = self._infer_teacher_feature_dim() if feature_dim is None else int(feature_dim)
-        cache_dir = self._resolve_relative_cache_dir(sns_cfg.SNS_CACHE_DIR)
-
-        dataset = self._sanitize_cache_token(self.cfg.DATASET.NAME)
-        modal = self._sanitize_cache_token(self.cfg.TRAINER.MODAL)
-        teacher = self._sanitize_cache_token(sns_cfg.TEACHER_NAME)
-        seed = self._sanitize_cache_token(self.cfg.SEED)
-        rank = self._sanitize_cache_token(sns_cfg.SNS_RANK)
-        pca_rank = self._sanitize_cache_token(sns_cfg.SNS_PCA_RANK)
-        semantic_rank = self._sanitize_cache_token(sns_cfg.SNS_SEMANTIC_RANK)
-        max_samples = self._sanitize_cache_token(sns_cfg.SNS_MAX_SAMPLES)
-        center = self._sanitize_cache_token(sns_cfg.SNS_CENTER)
-        niter = self._sanitize_cache_token(sns_cfg.SNS_PCA_NITER)
-        filename = (
-            f"sns_{SNS_CACHE_VERSION}_{dataset}_{modal}_seed{seed}_{teacher}_"
-            f"c{self.n_cls}_d{feature_dim}_r{rank}_pca{pca_rank}_"
-            f"sem{semantic_rank}_max{max_samples}_center{center}_niter{niter}.pt"
-        )
-        return osp.join(cache_dir, filename)
-
-    def _validate_sns_cache(self, cache, feature_dim):
-        if not isinstance(cache, dict):
-            return False, "SNS cache is not a metadata dictionary"
-
-        expected = self._get_sns_cache_metadata(feature_dim)
-        metadata = cache.get("metadata", None)
-        matched, reason = self._metadata_matches(metadata, expected)
-        if not matched:
-            return False, reason
-
-        basis = cache.get("basis", None)
-        if basis is None:
-            return False, "basis is missing"
-        expected_shape = (int(feature_dim), int(self.cfg.TRAINER.PROMPTKD.SNS_RANK))
-        if tuple(basis.shape) != expected_shape:
-            return False, f"basis shape mismatch: got {tuple(basis.shape)}, expected {expected_shape}"
-        if not torch.isfinite(basis.float()).all():
-            return False, "basis contains NaN or Inf"
-
-        required_keys = [
-            "selected_indices",
-            "pca_eigenvalues",
-            "semantic_overlap",
-            "nuisance_scores",
-            "sample_count",
-            "semantic_rank",
-            "candidate_rank",
-            "mean_subspace_energy_image",
-            "mean_subspace_energy_text",
-            "diag_text_features",
-        ]
-        for key in required_keys:
-            if key not in cache:
-                return False, f"{key} is missing"
-        return True, ""
-
-    def _compute_projection_summary(self, features, basis, rho, eps):
-        if features is None:
-            return 0.0, 0.0
-
-        x = features.detach().float().cpu()
-        basis = basis.detach().float().cpu()
-        component = (x @ basis) @ basis.t()
-        denom = x.pow(2).sum(dim=1).clamp_min(eps)
-        subspace_energy = (component.pow(2).sum(dim=1) / denom).mean().item()
-        projected = F.normalize(x - float(rho) * component, dim=-1, eps=eps)
-        cosine = F.cosine_similarity(x, projected, dim=1).mean().item()
-        removed_energy = (float(rho) ** 2) * subspace_energy
-        return float(removed_energy), float(cosine)
-
-    def _build_sns_stats_from_cache(self, cache, cache_path, loaded_from_cache):
-        sns_cfg = self.cfg.TRAINER.PROMPTKD
-        rho = float(sns_cfg.SNS_RHO)
-        eps = float(sns_cfg.SNS_EPS)
-        basis = cache["basis"].float()
-        selected_indices = cache["selected_indices"].long().tolist()
-        pca_eigenvalues = cache["pca_eigenvalues"].float()
-        semantic_overlap = cache["semantic_overlap"].float()
-        nuisance_scores = cache["nuisance_scores"].float()
-
-        mean_removed_energy_text, mean_cosine_before_after_text = self._compute_projection_summary(
-            cache.get("diag_text_features", None),
-            basis,
-            rho,
-            eps,
-        )
-        mean_removed_energy_image = (
-            (rho ** 2) * float(cache.get("mean_subspace_energy_image", 0.0))
-        )
-
-        selected_tensor = torch.tensor(selected_indices, dtype=torch.long)
-        eye = torch.eye(basis.shape[1], dtype=torch.float32)
-        orth_error = torch.linalg.norm(basis.t() @ basis - eye, ord="fro").item()
-
-        return {
-            "enabled": True,
-            "loaded_from_cache": bool(loaded_from_cache),
-            "cache_path": cache_path,
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "seed": int(self.cfg.SEED),
-            "sample_count": int(cache["sample_count"]),
-            "feature_dim": int(cache["feature_dim"]),
-            "candidate_rank": int(cache["candidate_rank"]),
-            "semantic_rank": int(cache["semantic_rank"]),
-            "nuisance_rank": int(basis.shape[1]),
-            "rho": rho,
-            "selected_indices": selected_indices,
-            "selected_eigenvalues": pca_eigenvalues[selected_tensor].tolist(),
-            "selected_semantic_overlap": semantic_overlap[selected_tensor].tolist(),
-            "selected_nuisance_scores": nuisance_scores[selected_tensor].tolist(),
-            "orthogonality_error": float(orth_error),
-            "mean_removed_energy_image": float(mean_removed_energy_image),
-            "mean_removed_energy_text": float(mean_removed_energy_text),
-            "mean_cosine_before_after_text": float(mean_cosine_before_after_text),
-        }
-
-    def _log_and_save_sns_diagnostics(self):
-        if self.sns_stats is None:
-            return
-
-        stats = self.sns_stats
-        print(f"[PromptKD][SNS] enabled: {stats['enabled']}")
-        print(
-            "[PromptKD][SNS] basis source: "
-            f"{'cache' if stats['loaded_from_cache'] else 'computed'}"
-        )
-        print(f"[PromptKD][SNS] cache path: {stats['cache_path']}")
-        print(
-            "[PromptKD][SNS] samples={sample_count}, dim={feature_dim}, "
-            "candidate_rank={candidate_rank}, semantic_rank={semantic_rank}, "
-            "nuisance_rank={nuisance_rank}, rho={rho}".format(**stats)
-        )
-        print(f"[PromptKD][SNS] selected PCA eigenvalues: {stats['selected_eigenvalues']}")
-        print(f"[PromptKD][SNS] selected semantic overlap: {stats['selected_semantic_overlap']}")
-        print(f"[PromptKD][SNS] selected nuisance scores: {stats['selected_nuisance_scores']}")
-        print(f"[PromptKD][SNS] basis orthogonality error: {stats['orthogonality_error']:.6e}")
-
-        output_dir = self.output_dir if self.output_dir else "."
-        os.makedirs(output_dir, exist_ok=True)
-        diag_path = osp.join(output_dir, self.cfg.TRAINER.PROMPTKD.SNS_DIAG_FILENAME)
-        with open(diag_path, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
-        print(f"[PromptKD][SNS] diagnostics saved to {diag_path}")
-
-    @torch.no_grad()
-    def _collect_sns_feature_samples(self):
-        sns_cfg = self.cfg.TRAINER.PROMPTKD
-        max_samples = int(sns_cfg.SNS_MAX_SAMPLES)
-        if max_samples < 2:
-            raise RuntimeError("SNS_MAX_SAMPLES must be at least 2")
-
-        loader = getattr(self, "train_loader_x", None)
-        if loader is None:
-            loader = getattr(self, "train_loader", None)
-        if loader is None:
-            raise RuntimeError("No training loader available for building SNS basis")
-
-        seed = int(self.cfg.SEED) if int(self.cfg.SEED) >= 0 else 0
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(seed + 47047)
-
-        sampled_features = None
-        sampled_scores = None
-        fallback_text_features = None
-
-        self.model_teacher.eval()
-        for batch in tqdm(loader, desc="Building SNS samples", leave=False):
-            image, _ = self.parse_batch_train(batch)
-            tea_image_features, tea_text_features, _ = self.model_teacher(image)
-            tea_image_features = tea_image_features.detach().float().cpu()
-
-            if fallback_text_features is None:
-                fallback_text_features = tea_text_features.detach().float().cpu()
-
-            if tea_image_features.numel() == 0:
-                continue
-            if not torch.isfinite(tea_image_features).all():
-                raise RuntimeError("SNS image features contain NaN or Inf")
-
-            batch_scores = torch.rand(tea_image_features.shape[0], generator=generator)
-            if sampled_features is None:
-                sampled_features = tea_image_features
-                sampled_scores = batch_scores
-            else:
-                sampled_features = torch.cat([sampled_features, tea_image_features], dim=0)
-                sampled_scores = torch.cat([sampled_scores, batch_scores], dim=0)
-
-            if sampled_features.shape[0] > max_samples:
-                keep = torch.topk(sampled_scores, k=max_samples, largest=True).indices
-                sampled_features = sampled_features[keep]
-                sampled_scores = sampled_scores[keep]
-
-        if sampled_features is None or sampled_features.shape[0] < 2:
-            raise RuntimeError("SNS needs at least 2 sampled teacher image features")
-        if fallback_text_features is None:
-            raise RuntimeError("SNS failed to collect raw teacher text features")
-
-        return sampled_features.contiguous(), fallback_text_features.contiguous()
-
-    @torch.no_grad()
-    def build_semantic_nuisance_subspace(self):
-        sns_cfg = self.cfg.TRAINER.PROMPTKD
-        self.sns_enabled = False
-        feature_dim = self._infer_teacher_feature_dim()
-        self.sns_cache_path = self._resolve_sns_cache_path(feature_dim)
-
-        if sns_cfg.SNS_CACHE and osp.exists(self.sns_cache_path) and not sns_cfg.SNS_RECOMPUTE:
-            cache = torch.load(self.sns_cache_path, map_location="cpu")
-            valid, reason = self._validate_sns_cache(cache, feature_dim)
-            if valid:
-                self.sns_basis = cache["basis"].detach().float().cpu()
-                self.sns_loaded_from_cache = True
-                self.sns_enabled = True
-                self.sns_stats = self._build_sns_stats_from_cache(
-                    cache,
-                    self.sns_cache_path,
-                    loaded_from_cache=True,
-                )
-                self._log_and_save_sns_diagnostics()
-                return
-            print(f"[PromptKD][SNS] Ignoring SNS cache: {reason}")
-
-        image_features, fallback_text_features = self._collect_sns_feature_samples()
-        if self.dvp_base_text_features is not None:
-            text_features = self.dvp_base_text_features.detach().float().cpu()
-        else:
-            text_features = fallback_text_features.detach().float().cpu()
-
-        if text_features.ndim != 2 or image_features.ndim != 2:
-            raise RuntimeError("SNS expects 2D image and text feature tensors")
-        if text_features.shape[0] != self.n_cls:
-            raise RuntimeError(
-                f"SNS text feature class count mismatch: got {text_features.shape[0]}, expected {self.n_cls}"
-            )
-
-        sample_count, feature_dim = image_features.shape
-        if text_features.shape[1] != feature_dim:
-            raise RuntimeError(
-                f"SNS feature dimension mismatch: image dim={feature_dim}, text dim={text_features.shape[1]}"
-            )
-        if not torch.isfinite(image_features).all() or not torch.isfinite(text_features).all():
-            raise RuntimeError("SNS input features contain NaN or Inf")
-
-        self.sns_cache_path = self._resolve_sns_cache_path(feature_dim)
-        sns_rank = int(sns_cfg.SNS_RANK)
-        if sns_rank < 1:
-            raise RuntimeError("SNS_RANK must be at least 1 when SNS is enabled")
-
-        max_candidate_rank = min(sample_count - 1, feature_dim)
-        pca_rank_cfg = int(sns_cfg.SNS_PCA_RANK)
-        if pca_rank_cfg <= 0:
-            pca_rank_cfg = max_candidate_rank
-        candidate_rank = min(pca_rank_cfg, max_candidate_rank)
-        if candidate_rank < 1:
-            raise RuntimeError("SNS candidate PCA rank must be at least 1")
-        if sns_rank > candidate_rank:
-            raise RuntimeError(
-                f"SNS_RANK ({sns_rank}) must be <= candidate PCA rank ({candidate_rank})"
-            )
-
-        feature_mean = image_features.mean(dim=0)
-        if bool(sns_cfg.SNS_CENTER):
-            centered_image_features = image_features - feature_mean
-            feature_mean_for_cache = feature_mean
-        else:
-            centered_image_features = image_features
-            feature_mean_for_cache = torch.zeros_like(feature_mean)
-
-        pca_device = torch.device(self.device)
-        if pca_device.type == "cuda" and not torch.cuda.is_available():
-            pca_device = torch.device("cpu")
-
-        try:
-            pca_input = centered_image_features.to(pca_device, dtype=torch.float32)
-            _, singular_values, candidate_dirs = torch.pca_lowrank(
-                pca_input,
-                q=candidate_rank,
-                center=False,
-                niter=int(sns_cfg.SNS_PCA_NITER),
-            )
-        except RuntimeError as exc:
-            if pca_device.type != "cuda":
-                raise RuntimeError(f"SNS PCA failed on CPU: {exc}") from exc
-            torch.cuda.empty_cache()
-            pca_device = torch.device("cpu")
-            pca_input = centered_image_features.to(pca_device, dtype=torch.float32)
-            _, singular_values, candidate_dirs = torch.pca_lowrank(
-                pca_input,
-                q=candidate_rank,
-                center=False,
-                niter=int(sns_cfg.SNS_PCA_NITER),
-            )
-
-        candidate_dirs = candidate_dirs.float()
-        pca_eigenvalues = (
-            singular_values.float().pow(2) / max(sample_count - 1, 1)
-        ).detach()
-
-        centered_text_features = text_features - text_features.mean(dim=0, keepdim=True)
-        max_semantic_rank = min(self.n_cls - 1, feature_dim)
-        requested_semantic_rank = int(sns_cfg.SNS_SEMANTIC_RANK)
-        if requested_semantic_rank <= 0:
-            requested_semantic_rank = min(64, max_semantic_rank)
-        else:
-            requested_semantic_rank = min(requested_semantic_rank, max_semantic_rank)
-
-        if requested_semantic_rank < 1:
-            raise RuntimeError("SNS semantic rank must be at least 1")
-
-        text_for_svd = centered_text_features.to(pca_device, dtype=torch.float32)
-        _, text_singular_values, text_vh = torch.linalg.svd(text_for_svd, full_matrices=False)
-        max_sv = float(text_singular_values.max().item()) if text_singular_values.numel() > 0 else 0.0
-        sv_tol = max(text_for_svd.shape) * torch.finfo(torch.float32).eps * max(max_sv, 1.0)
-        numerical_rank = int((text_singular_values > sv_tol).sum().item())
-        semantic_rank = min(requested_semantic_rank, numerical_rank)
-        if semantic_rank < 1:
-            raise RuntimeError(
-                "SNS could not build a semantic subspace because text features are numerically rank deficient"
-            )
-
-        semantic_basis = text_vh[:semantic_rank].t().contiguous()
-        semantic_overlap = (semantic_basis.t() @ candidate_dirs).pow(2).sum(dim=0).clamp(0.0, 1.0)
-        nuisance_scores = pca_eigenvalues.to(semantic_overlap.device) * (1.0 - semantic_overlap)
-        selected_indices = torch.topk(nuisance_scores, k=sns_rank, largest=True).indices
-        selected_dirs = candidate_dirs[:, selected_indices]
-        nuisance_basis, _ = torch.linalg.qr(selected_dirs, mode="reduced")
-        nuisance_basis = nuisance_basis[:, :sns_rank].contiguous().float().cpu()
-
-        if not torch.isfinite(nuisance_basis).all():
-            raise RuntimeError("SNS nuisance basis contains NaN or Inf")
-
-        diag_text_features = text_features.detach().float().cpu()
-        rho = float(sns_cfg.SNS_RHO)
-        eps = float(sns_cfg.SNS_EPS)
-        mean_removed_energy_image, _ = self._compute_projection_summary(
-            image_features,
-            nuisance_basis,
-            rho,
-            eps,
-        )
-        mean_removed_energy_text, mean_cosine_before_after_text = self._compute_projection_summary(
-            diag_text_features,
-            nuisance_basis,
-            rho,
-            eps,
-        )
-        mean_subspace_energy_image, _ = self._compute_projection_summary(
-            image_features,
-            nuisance_basis,
-            1.0,
-            eps,
-        )
-        mean_subspace_energy_text, _ = self._compute_projection_summary(
-            diag_text_features,
-            nuisance_basis,
-            1.0,
-            eps,
-        )
-
-        selected_indices_cpu = selected_indices.detach().cpu()
-        pca_eigenvalues_cpu = pca_eigenvalues.detach().cpu()
-        semantic_overlap_cpu = semantic_overlap.detach().cpu()
-        nuisance_scores_cpu = nuisance_scores.detach().cpu()
-        eye = torch.eye(sns_rank, dtype=torch.float32)
-        orthogonality_error = torch.linalg.norm(
-            nuisance_basis.t() @ nuisance_basis - eye,
-            ord="fro",
-        ).item()
-
-        metadata = self._get_sns_cache_metadata(feature_dim)
-        cache_payload = {
-            "metadata": metadata,
-            "cache_version": SNS_CACHE_VERSION,
-            "basis": nuisance_basis,
-            "selected_indices": selected_indices_cpu,
-            "pca_eigenvalues": pca_eigenvalues_cpu,
-            "semantic_overlap": semantic_overlap_cpu,
-            "nuisance_scores": nuisance_scores_cpu,
-            "sample_count": int(sample_count),
-            "feature_dim": int(feature_dim),
-            "semantic_rank": int(semantic_rank),
-            "candidate_rank": int(candidate_rank),
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "seed": int(self.cfg.SEED),
-            "teacher": sns_cfg.TEACHER_NAME,
-            "classnames": list(self.classnames),
-            "center": bool(sns_cfg.SNS_CENTER),
-            "feature_mean": feature_mean_for_cache.detach().cpu(),
-            "mean_subspace_energy_image": float(mean_subspace_energy_image),
-            "mean_subspace_energy_text": float(mean_subspace_energy_text),
-            "diag_text_features": diag_text_features.detach().cpu(),
-        }
-
-        self.sns_basis = nuisance_basis.detach().cpu()
-        self.sns_enabled = True
-        self.sns_loaded_from_cache = False
-        self.sns_stats = {
-            "enabled": True,
-            "loaded_from_cache": False,
-            "cache_path": self.sns_cache_path,
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "seed": int(self.cfg.SEED),
-            "sample_count": int(sample_count),
-            "feature_dim": int(feature_dim),
-            "candidate_rank": int(candidate_rank),
-            "semantic_rank": int(semantic_rank),
-            "nuisance_rank": int(sns_rank),
-            "rho": rho,
-            "selected_indices": selected_indices_cpu.tolist(),
-            "selected_eigenvalues": pca_eigenvalues_cpu[selected_indices_cpu].tolist(),
-            "selected_semantic_overlap": semantic_overlap_cpu[selected_indices_cpu].tolist(),
-            "selected_nuisance_scores": nuisance_scores_cpu[selected_indices_cpu].tolist(),
-            "orthogonality_error": float(orthogonality_error),
-            "mean_removed_energy_image": float(mean_removed_energy_image),
-            "mean_removed_energy_text": float(mean_removed_energy_text),
-            "mean_cosine_before_after_text": float(mean_cosine_before_after_text),
-        }
-
-        if sns_cfg.SNS_CACHE:
-            os.makedirs(osp.dirname(self.sns_cache_path), exist_ok=True)
-            torch.save(cache_payload, self.sns_cache_path)
-            print(f"[PromptKD][SNS] Saved SNS cache to {self.sns_cache_path}")
-
-        self._log_and_save_sns_diagnostics()
-
-    def apply_sns_projection(self, features):
-        if not self.sns_enabled:
-            return features
-        if self.sns_basis is None:
-            raise RuntimeError("SNS is enabled but sns_basis has not been initialized")
-
-        rho = float(self.cfg.TRAINER.PROMPTKD.SNS_RHO)
-        if rho == 0.0:
-            return features
-
-        x = features.float()
-        basis = self.sns_basis.to(device=x.device, dtype=torch.float32)
-        projected = x - rho * ((x @ basis) @ basis.t())
-        projected = F.normalize(
-            projected,
-            dim=-1,
-            eps=float(self.cfg.TRAINER.PROMPTKD.SNS_EPS),
-        )
-        return projected.to(dtype=features.dtype)
-
     @torch.no_grad()
     def get_teacher_guidance(self, image, label=None, apply_prior=True):
-        tea_image_features_raw, tea_text_features, tea_logits_raw = self.model_teacher(image, label)
+        tea_image_features, tea_text_features, tea_logits = self.model_teacher(image, label)
         teacher_text_features = self.get_teacher_text_features(tea_text_features)
-        teacher_image_features = self.apply_sns_projection(tea_image_features_raw)
-        teacher_text_features = self.apply_sns_projection(teacher_text_features)
 
-        if (
-            self.cfg.TRAINER.PROMPTKD.DVP_ENABLE
-            or self.cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT
-            or self.cfg.TRAINER.PROMPTKD.SNS_ENABLE
-        ):
+        if self.cfg.TRAINER.PROMPTKD.DVP_ENABLE or self.cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT:
             teacher_logit_scale = self._normalize_logit_scale(
                 self.model_teacher.logit_scale.exp(),
-                teacher_image_features.device,
-                teacher_image_features.dtype,
+                tea_image_features.device,
+                tea_image_features.dtype,
             )
-            teacher_logits = teacher_logit_scale * teacher_image_features @ teacher_text_features.t()
+            teacher_logits = teacher_logit_scale * tea_image_features @ teacher_text_features.t()
         else:
-            teacher_logits = tea_logits_raw
+            teacher_logits = tea_logits
 
         if apply_prior:
             teacher_logits_for_kd = self.get_teacher_logits_for_kd(teacher_logits)
         else:
             teacher_logits_for_kd = teacher_logits
 
-        return teacher_image_features, teacher_text_features, teacher_logits, teacher_logits_for_kd
+        return tea_image_features, teacher_text_features, teacher_logits, teacher_logits_for_kd
 
     def build_teacher_class_prior(self):
         prior_cfg = self.cfg.TRAINER.PROMPTKD
@@ -1393,14 +793,17 @@ class PromptKD(TrainerX):
 
         if should_load_cache:
             cache = torch.load(self.prior_cache_path, map_location="cpu")
-            valid_cache, cache_reason = self._validate_prior_cache(cache)
-            if valid_cache:
-                cached_prior = cache["class_prior"]
+            cached_prior = cache.get("class_prior", None)
+            if cached_prior is not None:
                 cached_prior = cached_prior.flatten()
-                class_prior = self._normalize_class_prior(cached_prior).to(self.device)
-                print(f"Loaded teacher class prior from cache: {self.prior_cache_path}")
-            else:
-                print(f"Ignoring teacher prior cache: {cache_reason}")
+                if cached_prior.shape[0] == self.n_cls:
+                    class_prior = self._normalize_class_prior(cached_prior).to(self.device)
+                    print(f"Loaded teacher class prior from cache: {self.prior_cache_path}")
+                else:
+                    print(
+                        "Ignoring teacher prior cache due to mismatched shape: "
+                        f"got {cached_prior.shape[0]}, expected {self.n_cls}"
+                    )
 
         if class_prior is None:
             if use_cache:
@@ -1434,8 +837,10 @@ class PromptKD(TrainerX):
                 torch.save(
                     {
                         "class_prior": class_prior.cpu(),
-                        "metadata": self._get_prior_cache_metadata(),
-                        "cache_version": PRIOR_CACHE_VERSION,
+                        "dataset": self.cfg.DATASET.NAME,
+                        "modal": self.cfg.TRAINER.MODAL,
+                        "n_cls": self.n_cls,
+                        "prior_temperature": self.prior_temperature,
                     },
                     self.prior_cache_path,
                 )
@@ -1524,16 +929,10 @@ class PromptKD(TrainerX):
         self._text_calibration_diag = None
         self.teacher_text_model = None
         self.dvp_text_features = None
-        self.dvp_base_text_features = None
         self.dvp_cache_path = None
         self.dvp_loaded_from_cache = False
         self.dvp_mass = None
         self.dvp_fallback_mask = None
-        self.sns_enabled = False
-        self.sns_basis = None
-        self.sns_stats = None
-        self.sns_cache_path = None
-        self.sns_loaded_from_cache = False
         self.teacher_class_prior = None
         self.prior_cache_path = None
 
@@ -1582,8 +981,6 @@ class PromptKD(TrainerX):
             dvp_result = self.build_domain_visual_prototypes()
             self.dvp_text_features = dvp_result["fused_text_features"].to(self.device).detach()
             self.dvp_text_features.requires_grad_(False)
-            self.dvp_base_text_features = dvp_result["base_text_features"].to(self.device).detach()
-            self.dvp_base_text_features.requires_grad_(False)
             self.dvp_cache_path = dvp_result["cache_path"]
             self.dvp_loaded_from_cache = dvp_result["loaded_from_cache"]
             self.dvp_mass = dvp_result["mass"].float()
@@ -1606,11 +1003,6 @@ class PromptKD(TrainerX):
             print(f"DVP cache path: {self.dvp_cache_path}")
         else:
             print("DVP disabled: using original shared class vectors")
-
-        if cfg.TRAINER.PROMPTKD.SNS_ENABLE:
-            self.build_semantic_nuisance_subspace()
-        else:
-            print("[PromptKD][SNS] disabled")
 
         self.build_teacher_class_prior()
 
@@ -1666,7 +1058,6 @@ class PromptKD(TrainerX):
 
         with autocast(enabled=prec == "amp"):
             image_ft, logit_scale = model(image, label)
-            image_ft = self.apply_sns_projection(image_ft)
             logit_scale = self._normalize_logit_scale(logit_scale, image_ft.device, image_ft.dtype)
             student_text_features = teacher_text_features.to(device=image_ft.device, dtype=image_ft.dtype)
             stu_logits = logit_scale * image_ft @ student_text_features.t().detach()
@@ -1754,7 +1145,6 @@ class PromptKD(TrainerX):
             image, label = self.parse_batch_test(batch)
             _, teacher_text_features, _, _ = self.get_teacher_guidance(image, label, apply_prior=False)
             image_ft, logit_scale = self.model(image, label)
-            image_ft = self.apply_sns_projection(image_ft)
             logit_scale = self._normalize_logit_scale(logit_scale, image_ft.device, image_ft.dtype)
             teacher_text_features = teacher_text_features.to(device=image_ft.device, dtype=image_ft.dtype)
 
