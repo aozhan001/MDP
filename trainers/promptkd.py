@@ -267,7 +267,6 @@ class CustomCLIP(nn.Module):
         self.VPT_image_trans = Feature_Trans_Module_two_layer(512, 768)
         self.cfg = cfg
 
-        self.VPT_image_trans = self.VPT_image_trans.cuda()
         convert_weights(self.VPT_image_trans)
 
     def forward(self, image, label=None):
@@ -285,7 +284,7 @@ class CustomCLIP_teacher(nn.Module):
         self.prompt_learner = VLPromptLearner(cfg, classnames, clip_model, True)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model).cuda()
+        self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
