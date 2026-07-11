@@ -20,8 +20,6 @@ from clip.model import convert_weights
 from .imagenet_templates import IMAGENET_TEMPLATES, IMAGENET_TEMPLATES_SELECT
 from .promptkd_calibration import (
     CalibrationFallback,
-    fuse_dvp_text_features,
-    fuse_mtp_text_features,
     get_scoring_class_slice,
     load_cached_calibration_json,
     make_calibration_payload,
@@ -35,7 +33,8 @@ from .promptkd_calibration import (
 
 _tokenizer = _Tokenizer()
 
-DVP_CACHE_VERSION = "v3"
+DVP_CACHE_VERSION = "v4_legacy_exact"
+LEGACY_EXACT_IMPLEMENTATION = "legacy_exact"
 
 DATASET_CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -54,6 +53,30 @@ DATASET_CUSTOM_TEMPLATES = {
     "ImageNetA": "a photo of a {}.",
     "ImageNetR": "a photo of a {}.",
 }
+
+
+def apply_legacy_dvp_text_features(base_text_features, visual_prototypes, alpha, eps):
+    """Fuse DVP features with the aozhan-mdp formula used in training."""
+
+    return F.normalize(
+        (1.0 - float(alpha)) * base_text_features + float(alpha) * visual_prototypes,
+        dim=1,
+        eps=float(eps),
+    )
+
+
+def apply_legacy_mtp_text_features(base_text_features, mtp_text_features, alpha):
+    """Fuse MTP text features in the original PromptKD dtype and order."""
+
+    alpha = float(alpha)
+    if mtp_text_features is None or alpha == 0.0:
+        return base_text_features
+    mtp_text_features = mtp_text_features.to(
+        device=base_text_features.device,
+        dtype=base_text_features.dtype,
+    )
+    calibrated = (1.0 - alpha) * base_text_features + alpha * mtp_text_features
+    return calibrated / calibrated.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 class Feature_Trans_Module_two_layer(nn.Module):
@@ -592,14 +615,11 @@ class PromptKD(TrainerX):
                 mtp_features = self.build_multi_template_text_features(classnames, tea_text_features.device)
             mtp_features = self._align_text_feature_shape(mtp_features, tea_text_features)
             if mtp_features is not None:
-                alpha = self.get_mtp_alpha()
-                calibrated = fuse_mtp_text_features(
+                calibrated = apply_legacy_mtp_text_features(
                     calibrated,
                     mtp_features,
-                    alpha,
-                    eps=float(self.cfg.TRAINER.PROMPTKD.AUTO_CALIBRATION_EPS),
+                    self.get_mtp_alpha(),
                 )
-                calibrated = calibrated.to(device=tea_text_features.device, dtype=tea_text_features.dtype)
 
         if self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
             self._record_text_calibration_diag(tea_text_features, calibrated)
@@ -634,6 +654,7 @@ class PromptKD(TrainerX):
             "seed": int(self.cfg.SEED),
             "teacher_name": cfg_kd.TEACHER_NAME,
             "n_cls": int(self.n_cls),
+            "implementation": LEGACY_EXACT_IMPLEMENTATION,
             "prior_temperature": float(self.prior_temperature),
             "selected_mtp_alpha": float(self.get_mtp_alpha()),
             "selected_dvp_alpha": float(self.get_dvp_alpha()),
@@ -720,6 +741,7 @@ class PromptKD(TrainerX):
             "topk": int(dvp_cfg.DVP_TOPK),
             "min_mass": float(dvp_cfg.DVP_MIN_MASS),
             "cache_version": DVP_CACHE_VERSION,
+            "implementation": LEGACY_EXACT_IMPLEMENTATION,
         }
 
         if dvp_cfg.DVP_CACHE and osp.exists(cache_path) and not dvp_cfg.DVP_RECOMPUTE:
@@ -745,26 +767,21 @@ class PromptKD(TrainerX):
             raise RuntimeError("No training loader available for building DVP prototypes")
 
         self.model_teacher.eval()
-        base_text_features = self.get_raw_teacher_text_features().to(self.device)
+        base_text_features = None
         proto_sum = None
         mass = None
         eps = float(dvp_cfg.DVP_EPS)
 
         for batch in tqdm(loader, desc="Building DVP", leave=False):
             image = self.parse_batch_calibration(batch)
-            tea_image_features = self.model_teacher.image_encoder(image.type(self.model_teacher.dtype))
-            tea_image_features = F.normalize(tea_image_features.float(), dim=-1, eps=eps)
-            logit_scale = self._normalize_logit_scale(
-                self.model_teacher.logit_scale.exp(),
-                tea_image_features.device,
-                tea_image_features.dtype,
-            )
-            tea_logits = logit_scale * tea_image_features @ base_text_features.float().t()
+            tea_image_features, tea_text_features, tea_logits = self.model_teacher(image)
 
             tea_image_features = tea_image_features.detach().float()
+            tea_text_features = tea_text_features.detach().float()
             tea_logits = tea_logits.detach().float()
 
-            if proto_sum is None:
+            if base_text_features is None:
+                base_text_features = tea_text_features
                 feat_dim = tea_image_features.shape[1]
                 proto_sum = torch.zeros(
                     self.n_cls,
@@ -792,7 +809,7 @@ class PromptKD(TrainerX):
                 proto_sum += probs.t() @ tea_image_features
                 mass += probs.sum(dim=0)
 
-        if proto_sum is None:
+        if base_text_features is None:
             raise RuntimeError("Failed to build DVP prototypes because no training batches were found")
 
         visual_proto = proto_sum / mass.clamp_min(eps).unsqueeze(1)
@@ -909,26 +926,6 @@ class PromptKD(TrainerX):
                     )
 
         if class_prior is None:
-            auto_prior = getattr(self, "auto_calibration_teacher_prior", None)
-            if auto_prior is not None:
-                auto_prior = auto_prior.flatten()
-                if auto_prior.shape[0] == self.n_cls:
-                    class_prior = self._normalize_class_prior(auto_prior).to(self.device)
-                    print("[PromptKD][AutoCalibration] Reusing selected teacher prior from calibration search")
-                    if use_cache:
-                        cache_dir = osp.dirname(self.prior_cache_path)
-                        if cache_dir:
-                            mkdir_if_missing(cache_dir)
-                        torch.save(
-                            {
-                                "class_prior": class_prior.cpu(),
-                                "metadata": prior_cache_metadata,
-                            },
-                            self.prior_cache_path,
-                        )
-                        print(f"Saved teacher class prior to cache: {self.prior_cache_path}")
-
-        if class_prior is None:
             if use_cache:
                 cache_dir = osp.dirname(self.prior_cache_path)
                 if cache_dir:
@@ -944,21 +941,12 @@ class PromptKD(TrainerX):
             total_samples = 0
             self.model_teacher.eval()
 
-            def accumulate_prior():
-                nonlocal total_samples
-                for batch in tqdm(loader, desc="Building teacher class prior"):
-                    image = self.parse_batch_calibration(batch)
-                    _, _, teacher_logits, _ = self.get_teacher_guidance(image, apply_prior=False)
-                    probs = torch.softmax(teacher_logits / self.prior_temperature, dim=1)
-                    prior_sum.add_(probs.float().sum(dim=0))
-                    total_samples += probs.shape[0]
-
-            if prior_cfg.AUTO_CALIBRATE:
-                calibration_seed = int(self.cfg.SEED) if int(self.cfg.SEED) >= 0 else 0
-                with preserved_rng(calibration_seed):
-                    accumulate_prior()
-            else:
-                accumulate_prior()
+            for batch in tqdm(loader, desc="Building teacher class prior"):
+                image = self.parse_batch_calibration(batch)
+                _, _, teacher_logits, _ = self.get_teacher_guidance(image, apply_prior=False)
+                probs = torch.softmax(teacher_logits / self.prior_temperature, dim=1)
+                prior_sum += probs.float().sum(dim=0)
+                total_samples += probs.shape[0]
 
             if total_samples == 0:
                 raise RuntimeError("No samples found when building teacher class prior")
@@ -1055,6 +1043,7 @@ class PromptKD(TrainerX):
             "seed": int(self.cfg.SEED),
             "teacher_name": cfg_kd.TEACHER_NAME,
             "num_classes": int(self.n_cls),
+            "implementation": LEGACY_EXACT_IMPLEMENTATION,
             "candidate_space": {
                 "mtp_alpha": [float(v) for v in candidate_space["mtp_alpha"]],
                 "dvp_alpha": [float(v) for v in candidate_space["dvp_alpha"]],
@@ -1369,12 +1358,7 @@ class PromptKD(TrainerX):
         dvp_available = False
         if cfg.TRAINER.PROMPTKD.DVP_ENABLE:
             try:
-                if cfg.TRAINER.PROMPTKD.AUTO_CALIBRATE:
-                    calibration_seed = int(cfg.SEED) if int(cfg.SEED) >= 0 else 0
-                    with preserved_rng(calibration_seed):
-                        dvp_result = self.build_domain_visual_prototypes()
-                else:
-                    dvp_result = self.build_domain_visual_prototypes()
+                dvp_result = self.build_domain_visual_prototypes()
                 self.dvp_base_text_features = dvp_result["base_text_features"].to(self.device).detach()
                 self.dvp_visual_prototypes = dvp_result["visual_prototypes"].to(self.device).detach()
                 self.dvp_base_text_features.requires_grad_(False)
@@ -1404,11 +1388,11 @@ class PromptKD(TrainerX):
 
         if cfg.TRAINER.PROMPTKD.DVP_ENABLE:
             if self.dvp_visual_prototypes is not None:
-                self.dvp_text_features = fuse_dvp_text_features(
-                    self.raw_teacher_text_features,
+                self.dvp_text_features = apply_legacy_dvp_text_features(
+                    self.dvp_base_text_features,
                     self.dvp_visual_prototypes,
                     self.get_dvp_alpha(),
-                    eps=float(cfg.TRAINER.PROMPTKD.DVP_EPS),
+                    float(cfg.TRAINER.PROMPTKD.DVP_EPS),
                 ).to(self.device).detach()
                 self.dvp_text_features.requires_grad_(False)
 

@@ -316,6 +316,8 @@ def search_calibration_parameters(
 ):
     """Grid-search MTP, DVP, and prior parameters from unlabeled features."""
 
+    # Search-time feature fusion is only used for parameter selection.
+    # Final training features and priors are rebuilt by the legacy-exact PromptKD path.
     if not isinstance(fallback, CalibrationFallback):
         fallback = CalibrationFallback(*fallback)
 
