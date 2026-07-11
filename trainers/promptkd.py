@@ -18,10 +18,24 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from clip.model import convert_weights
 
 from .imagenet_templates import IMAGENET_TEMPLATES, IMAGENET_TEMPLATES_SELECT
+from .promptkd_calibration import (
+    CalibrationFallback,
+    fuse_dvp_text_features,
+    fuse_mtp_text_features,
+    get_scoring_class_slice,
+    load_cached_calibration_json,
+    make_calibration_payload,
+    parse_batch_calibration as parse_batch_calibration_image,
+    preserved_rng,
+    resolve_candidate_space,
+    save_calibration_json,
+    search_calibration_parameters,
+    stable_hash,
+)
 
 _tokenizer = _Tokenizer()
 
-DVP_CACHE_VERSION = "v2"
+DVP_CACHE_VERSION = "v3"
 
 DATASET_CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -305,6 +319,53 @@ class PromptKD(TrainerX):
     def _sanitize_cache_token(self, value):
         return str(value).replace("/", "-").replace("\\", "-").replace(" ", "")
 
+    def _auto_warn(self, message):
+        print(f"[PromptKD][AutoCalibration][Warning] {message}")
+
+    def _configured_fallback(self):
+        cfg_kd = self.cfg.TRAINER.PROMPTKD
+        return CalibrationFallback(
+            mtp_alpha=float(cfg_kd.MTP_ALPHA),
+            dvp_alpha=float(cfg_kd.DVP_ALPHA),
+            prior_gamma=float(cfg_kd.PRIOR_GAMMA),
+        )
+
+    def _calibration_succeeded(self):
+        return bool(getattr(self, "auto_calibration_success", False))
+
+    def get_mtp_alpha(self):
+        if self._calibration_succeeded() and self.selected_mtp_alpha is not None:
+            return float(self.selected_mtp_alpha)
+        return float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA)
+
+    def get_dvp_alpha(self):
+        if getattr(self, "dvp_force_disabled", False):
+            return 0.0
+        if self._calibration_succeeded() and self.selected_dvp_alpha is not None:
+            return float(self.selected_dvp_alpha)
+        return float(self.cfg.TRAINER.PROMPTKD.DVP_ALPHA)
+
+    def get_prior_gamma(self):
+        if self._calibration_succeeded() and self.selected_prior_gamma is not None:
+            return float(self.selected_prior_gamma)
+        return float(self.cfg.TRAINER.PROMPTKD.PRIOR_GAMMA)
+
+    def _log_auto_calibration_disabled(self):
+        fallback = self._configured_fallback()
+        print("[PromptKD][AutoCalibration] disabled, using configured parameters:")
+        print(f"MTP_ALPHA={fallback.mtp_alpha}")
+        print(f"DVP_ALPHA={fallback.dvp_alpha}")
+        print(f"PRIOR_GAMMA={fallback.prior_gamma}")
+
+    def _log_auto_calibration_fallback(self, reason):
+        fallback = self._configured_fallback()
+        print("[PromptKD][AutoCalibration][Warning]")
+        print("Calibration failed, falling back to configured values:")
+        print(f"MTP_ALPHA={fallback.mtp_alpha}")
+        print(f"DVP_ALPHA={self.get_dvp_alpha()}")
+        print(f"PRIOR_GAMMA={fallback.prior_gamma}")
+        print(f"Reason: {reason}")
+
     def get_current_classnames(self):
         if hasattr(self, "dm") and hasattr(self.dm, "dataset") and hasattr(self.dm.dataset, "classnames"):
             classnames = self.dm.dataset.classnames
@@ -514,7 +575,7 @@ class PromptKD(TrainerX):
         }
 
     def _get_base_teacher_text_features(self, tea_text_features):
-        if self.cfg.TRAINER.PROMPTKD.DVP_ENABLE:
+        if self.cfg.TRAINER.PROMPTKD.DVP_ENABLE and self.dvp_text_features is not None:
             return self._get_shared_text_features(
                 device=tea_text_features.device,
                 dtype=tea_text_features.dtype,
@@ -527,12 +588,19 @@ class PromptKD(TrainerX):
 
         if self.cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT:
             classnames = self.get_current_classnames()
-            mtp_features = self.build_multi_template_text_features(classnames, tea_text_features.device)
+            mtp_features = self.mtp_text_features
+            if mtp_features is None:
+                mtp_features = self.build_multi_template_text_features(classnames, tea_text_features.device)
             mtp_features = self._align_text_feature_shape(mtp_features, tea_text_features)
             if mtp_features is not None:
-                alpha = float(self.cfg.TRAINER.PROMPTKD.MTP_ALPHA)
-                calibrated = (1.0 - alpha) * calibrated + alpha * mtp_features
-                calibrated = calibrated / calibrated.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                alpha = self.get_mtp_alpha()
+                calibrated = fuse_mtp_text_features(
+                    calibrated,
+                    mtp_features,
+                    alpha,
+                    eps=float(self.cfg.TRAINER.PROMPTKD.AUTO_CALIBRATION_EPS),
+                )
+                calibrated = calibrated.to(device=tea_text_features.device, dtype=tea_text_features.dtype)
 
         if self.cfg.TRAINER.PROMPTKD.TEXT_CALIBRATION_DIAGNOSE:
             self._record_text_calibration_diag(tea_text_features, calibrated)
@@ -558,10 +626,36 @@ class PromptKD(TrainerX):
         class_prior = class_prior / class_prior.sum()
         return class_prior
 
+    def _get_prior_cache_metadata(self):
+        cfg_kd = self.cfg.TRAINER.PROMPTKD
+        templates = self.get_prompt_templates() if cfg_kd.USE_MULTI_TEMPLATE_TEXT else []
+        return {
+            "dataset": self.cfg.DATASET.NAME,
+            "modal": self.cfg.TRAINER.MODAL,
+            "seed": int(self.cfg.SEED),
+            "teacher_name": cfg_kd.TEACHER_NAME,
+            "n_cls": int(self.n_cls),
+            "prior_temperature": float(self.prior_temperature),
+            "selected_mtp_alpha": float(self.get_mtp_alpha()),
+            "selected_dvp_alpha": float(self.get_dvp_alpha()),
+            "mtp_template_set": str(cfg_kd.MTP_TEMPLATE_SET),
+            "mtp_custom_templates_hash": stable_hash(str(cfg_kd.MTP_CUSTOM_TEMPLATES)),
+            "mtp_templates_hash": stable_hash(templates),
+            "mtp_normalize_each_template": bool(cfg_kd.MTP_NORMALIZE_EACH_TEMPLATE),
+            "dvp_cache_version": DVP_CACHE_VERSION,
+            "dvp_hard": bool(cfg_kd.DVP_HARD),
+            "dvp_topk": int(cfg_kd.DVP_TOPK),
+            "dvp_min_mass": float(cfg_kd.DVP_MIN_MASS),
+        }
+
     def _get_prior_cache_path(self):
+        metadata = self._get_prior_cache_metadata()
+        cache_hash = stable_hash(metadata)
         cache_name = (
             f"{self.cfg.TRAINER.MODAL}_{self.cfg.DATASET.NAME}_seed{self.cfg.SEED}"
-            f"_ncls{self.n_cls}_temp{self.prior_temperature}.pth"
+            f"_ncls{self.n_cls}_ma{self._sanitize_cache_token(self.get_mtp_alpha())}"
+            f"_da{self._sanitize_cache_token(self.get_dvp_alpha())}"
+            f"_temp{self._sanitize_cache_token(self.prior_temperature)}_{cache_hash}.pth"
         )
         return osp.join(self.cfg.TRAINER.PROMPTKD.PRIOR_CACHE_DIR, cache_name)
 
@@ -593,7 +687,7 @@ class PromptKD(TrainerX):
 
         prior = self.teacher_class_prior.to(tea_logits.device).type_as(tea_logits)
         prior_log = torch.log(prior.clamp_min(self.prior_eps)).unsqueeze(0)
-        return tea_logits - self.prior_gamma * prior_log
+        return tea_logits - self.get_prior_gamma() * prior_log
 
     def compute_kd_loss(self, teacher_logits, student_logits, temperature):
         teacher_logits = torch.nan_to_num(
@@ -617,20 +711,33 @@ class PromptKD(TrainerX):
     def build_domain_visual_prototypes(self):
         dvp_cfg = self.cfg.TRAINER.PROMPTKD
         cache_path = self._resolve_dvp_cache_path()
+        expected_metadata = {
+            "dataset": self.cfg.DATASET.NAME,
+            "modal": self.cfg.TRAINER.MODAL,
+            "seed": int(self.cfg.SEED),
+            "teacher": dvp_cfg.TEACHER_NAME,
+            "n_cls": int(self.n_cls),
+            "hard": bool(dvp_cfg.DVP_HARD),
+            "topk": int(dvp_cfg.DVP_TOPK),
+            "min_mass": float(dvp_cfg.DVP_MIN_MASS),
+            "cache_version": DVP_CACHE_VERSION,
+        }
 
         if dvp_cfg.DVP_CACHE and osp.exists(cache_path) and not dvp_cfg.DVP_RECOMPUTE:
             cache = torch.load(cache_path, map_location="cpu")
-            print(f"Loaded DVP cache from {cache_path}")
-            mass = cache["mass"].float()
-            return {
-                "fused_text_features": cache["fused_text_features"].float(),
-                "base_text_features": cache["base_text_features"].float(),
-                "visual_prototypes": cache["visual_prototypes"].float(),
-                "mass": mass,
-                "cache_path": cache_path,
-                "loaded_from_cache": True,
-                "fallback_mask": mass < float(dvp_cfg.DVP_MIN_MASS),
-            }
+            if cache.get("metadata") == expected_metadata:
+                print(f"Loaded DVP cache from {cache_path}")
+                mass = cache["mass"].float()
+                fallback_mask = cache.get("fallback_mask", mass < float(dvp_cfg.DVP_MIN_MASS))
+                return {
+                    "base_text_features": cache["base_text_features"].float(),
+                    "visual_prototypes": cache["visual_prototypes"].float(),
+                    "mass": mass,
+                    "cache_path": cache_path,
+                    "loaded_from_cache": True,
+                    "fallback_mask": fallback_mask.bool(),
+                }
+            print("Ignoring DVP cache due to metadata mismatch")
 
         loader = getattr(self, "train_loader_x", None)
         if loader is None:
@@ -639,21 +746,26 @@ class PromptKD(TrainerX):
             raise RuntimeError("No training loader available for building DVP prototypes")
 
         self.model_teacher.eval()
-        base_text_features = None
+        base_text_features = self.get_raw_teacher_text_features().to(self.device)
         proto_sum = None
         mass = None
         eps = float(dvp_cfg.DVP_EPS)
 
         for batch in tqdm(loader, desc="Building DVP", leave=False):
-            image, _ = self.parse_batch_train(batch)
-            tea_image_features, tea_text_features, tea_logits = self.model_teacher(image)
+            image = self.parse_batch_calibration(batch)
+            tea_image_features = self.model_teacher.image_encoder(image.type(self.model_teacher.dtype))
+            tea_image_features = F.normalize(tea_image_features.float(), dim=-1, eps=eps)
+            logit_scale = self._normalize_logit_scale(
+                self.model_teacher.logit_scale.exp(),
+                tea_image_features.device,
+                tea_image_features.dtype,
+            )
+            tea_logits = logit_scale * tea_image_features @ base_text_features.float().t()
 
             tea_image_features = tea_image_features.detach().float()
-            tea_text_features = tea_text_features.detach().float()
             tea_logits = tea_logits.detach().float()
 
-            if base_text_features is None:
-                base_text_features = tea_text_features
+            if proto_sum is None:
                 feat_dim = tea_image_features.shape[1]
                 proto_sum = torch.zeros(
                     self.n_cls,
@@ -681,7 +793,7 @@ class PromptKD(TrainerX):
                 proto_sum += probs.t() @ tea_image_features
                 mass += probs.sum(dim=0)
 
-        if base_text_features is None:
+        if proto_sum is None:
             raise RuntimeError("Failed to build DVP prototypes because no training batches were found")
 
         visual_proto = proto_sum / mass.clamp_min(eps).unsqueeze(1)
@@ -691,26 +803,12 @@ class PromptKD(TrainerX):
         if fallback_mask.any():
             visual_proto[fallback_mask] = base_text_features[fallback_mask]
 
-        alpha = float(dvp_cfg.DVP_ALPHA)
-        fused = F.normalize(
-            (1.0 - alpha) * base_text_features + alpha * visual_proto,
-            dim=1,
-            eps=eps,
-        )
-
         cache_payload = {
-            "fused_text_features": fused.detach().cpu(),
             "base_text_features": base_text_features.detach().cpu(),
             "visual_prototypes": visual_proto.detach().cpu(),
             "mass": mass.detach().cpu(),
-            "dataset": self.cfg.DATASET.NAME,
-            "modal": self.cfg.TRAINER.MODAL,
-            "alpha": dvp_cfg.DVP_ALPHA,
-            "hard": dvp_cfg.DVP_HARD,
-            "topk": dvp_cfg.DVP_TOPK,
-            "teacher": dvp_cfg.TEACHER_NAME,
-            "n_cls": self.n_cls,
-            "cache_version": DVP_CACHE_VERSION,
+            "fallback_mask": fallback_mask.detach().cpu(),
+            "metadata": expected_metadata,
         }
 
         if dvp_cfg.DVP_CACHE:
@@ -722,7 +820,6 @@ class PromptKD(TrainerX):
             **cache_payload,
             "cache_path": cache_path,
             "loaded_from_cache": False,
-            "fallback_mask": fallback_mask.detach().cpu(),
         }
 
     def _resolve_dvp_cache_path(self):
@@ -738,14 +835,13 @@ class PromptKD(TrainerX):
         dataset = self._sanitize_cache_token(self.cfg.DATASET.NAME)
         modal = self._sanitize_cache_token(self.cfg.TRAINER.MODAL)
         teacher = self._sanitize_cache_token(dvp_cfg.TEACHER_NAME)
-        alpha = self._sanitize_cache_token(dvp_cfg.DVP_ALPHA)
         hard = self._sanitize_cache_token(dvp_cfg.DVP_HARD)
         topk = self._sanitize_cache_token(dvp_cfg.DVP_TOPK)
         min_mass = self._sanitize_cache_token(dvp_cfg.DVP_MIN_MASS)
         seed = self._sanitize_cache_token(self.cfg.SEED)
         filename = (
             f"dvp_{DVP_CACHE_VERSION}_{dataset}_{modal}_seed{seed}_{teacher}_"
-            f"a{alpha}_hard{hard}_topk{topk}_minm{min_mass}_c{self.n_cls}.pt"
+            f"hard{hard}_topk{topk}_minm{min_mass}_c{self.n_cls}.pt"
         )
         return osp.join(cache_dir, filename)
 
@@ -774,11 +870,12 @@ class PromptKD(TrainerX):
     def build_teacher_class_prior(self):
         prior_cfg = self.cfg.TRAINER.PROMPTKD
         self.prior_correct = prior_cfg.PRIOR_CORRECT
-        self.prior_gamma = prior_cfg.PRIOR_GAMMA
+        self.prior_gamma = self.get_prior_gamma()
         self.prior_eps = prior_cfg.PRIOR_EPS
         self.prior_temperature = prior_cfg.PRIOR_TEMPERATURE
         self.prior_print_topk = prior_cfg.PRIOR_PRINT_TOPK
         self.prior_cache_path = self._get_prior_cache_path()
+        prior_cache_metadata = self._get_prior_cache_metadata()
 
         if not self.prior_correct:
             class_prior = torch.full((self.n_cls,), 1.0 / self.n_cls, device=self.device)
@@ -792,9 +889,16 @@ class PromptKD(TrainerX):
         should_load_cache = use_cache and osp.exists(self.prior_cache_path) and not prior_cfg.PRIOR_RECOMPUTE
 
         if should_load_cache:
-            cache = torch.load(self.prior_cache_path, map_location="cpu")
+            try:
+                cache = torch.load(self.prior_cache_path, map_location="cpu")
+            except (OSError, RuntimeError, EOFError) as exc:
+                print(f"Ignoring teacher prior cache because it could not be loaded: {exc}")
+                cache = {}
             cached_prior = cache.get("class_prior", None)
-            if cached_prior is not None:
+            cached_metadata = cache.get("metadata", None)
+            if cached_metadata != prior_cache_metadata:
+                print("Ignoring teacher prior cache due to metadata mismatch")
+            elif cached_prior is not None:
                 cached_prior = cached_prior.flatten()
                 if cached_prior.shape[0] == self.n_cls:
                     class_prior = self._normalize_class_prior(cached_prior).to(self.device)
@@ -804,6 +908,26 @@ class PromptKD(TrainerX):
                         "Ignoring teacher prior cache due to mismatched shape: "
                         f"got {cached_prior.shape[0]}, expected {self.n_cls}"
                     )
+
+        if class_prior is None:
+            auto_prior = getattr(self, "auto_calibration_teacher_prior", None)
+            if auto_prior is not None:
+                auto_prior = auto_prior.flatten()
+                if auto_prior.shape[0] == self.n_cls:
+                    class_prior = self._normalize_class_prior(auto_prior).to(self.device)
+                    print("[PromptKD][AutoCalibration] Reusing selected teacher prior from calibration search")
+                    if use_cache:
+                        cache_dir = osp.dirname(self.prior_cache_path)
+                        if cache_dir:
+                            mkdir_if_missing(cache_dir)
+                        torch.save(
+                            {
+                                "class_prior": class_prior.cpu(),
+                                "metadata": prior_cache_metadata,
+                            },
+                            self.prior_cache_path,
+                        )
+                        print(f"Saved teacher class prior to cache: {self.prior_cache_path}")
 
         if class_prior is None:
             if use_cache:
@@ -821,12 +945,21 @@ class PromptKD(TrainerX):
             total_samples = 0
             self.model_teacher.eval()
 
-            for batch in tqdm(loader, desc="Building teacher class prior"):
-                image, _ = self.parse_batch_train(batch)
-                _, _, teacher_logits, _ = self.get_teacher_guidance(image, apply_prior=False)
-                probs = torch.softmax(teacher_logits / self.prior_temperature, dim=1)
-                prior_sum += probs.float().sum(dim=0)
-                total_samples += probs.shape[0]
+            def accumulate_prior():
+                nonlocal total_samples
+                for batch in tqdm(loader, desc="Building teacher class prior"):
+                    image = self.parse_batch_calibration(batch)
+                    _, _, teacher_logits, _ = self.get_teacher_guidance(image, apply_prior=False)
+                    probs = torch.softmax(teacher_logits / self.prior_temperature, dim=1)
+                    prior_sum.add_(probs.float().sum(dim=0))
+                    total_samples += probs.shape[0]
+
+            if prior_cfg.AUTO_CALIBRATE:
+                calibration_seed = int(self.cfg.SEED) if int(self.cfg.SEED) >= 0 else 0
+                with preserved_rng(calibration_seed):
+                    accumulate_prior()
+            else:
+                accumulate_prior()
 
             if total_samples == 0:
                 raise RuntimeError("No samples found when building teacher class prior")
@@ -837,10 +970,7 @@ class PromptKD(TrainerX):
                 torch.save(
                     {
                         "class_prior": class_prior.cpu(),
-                        "dataset": self.cfg.DATASET.NAME,
-                        "modal": self.cfg.TRAINER.MODAL,
-                        "n_cls": self.n_cls,
-                        "prior_temperature": self.prior_temperature,
+                        "metadata": prior_cache_metadata,
                     },
                     self.prior_cache_path,
                 )
@@ -849,6 +979,240 @@ class PromptKD(TrainerX):
         self._set_teacher_class_prior(class_prior)
         self.model_teacher.eval()
         self._log_teacher_class_prior(self.teacher_class_prior)
+
+    def parse_batch_calibration(self, batch):
+        image = parse_batch_calibration_image(batch)
+        return image.to(self.device)
+
+    @torch.no_grad()
+    def get_raw_teacher_text_features(self):
+        """Return normalized PromptKD teacher text features without image input."""
+
+        self.model_teacher.eval()
+        prompts = self.model_teacher.prompt_learner()
+        text_device = prompts.device
+        tokenized_prompts = self.model_teacher.tokenized_prompts.to(text_device)
+        text_features = self.model_teacher.text_encoder(prompts.to(text_device), tokenized_prompts)
+        text_features = F.normalize(text_features.float(), dim=-1, eps=1e-12)
+        return text_features.detach()
+
+    @torch.no_grad()
+    def collect_unlabeled_calibration_features(self):
+        """Collect normalized teacher image features from unlabeled training images."""
+
+        cfg_kd = self.cfg.TRAINER.PROMPTKD
+        loader = getattr(self, "train_loader_x", None)
+        if loader is None:
+            loader = getattr(self, "train_loader", None)
+        if loader is None:
+            raise RuntimeError("No training loader available for automatic calibration")
+
+        max_batches = int(cfg_kd.AUTO_CALIBRATION_MAX_BATCHES)
+        max_samples = int(cfg_kd.AUTO_CALIBRATION_MAX_SAMPLES)
+        if max_batches <= 0 or max_samples <= 0:
+            raise RuntimeError("Automatic calibration limits allow zero samples")
+
+        self.model_teacher.eval()
+        features = []
+        num_batches = 0
+        num_samples = 0
+        eps = float(cfg_kd.AUTO_CALIBRATION_EPS)
+
+        for batch in tqdm(loader, desc="Collecting calibration features", leave=False):
+            if num_batches >= max_batches or num_samples >= max_samples:
+                break
+
+            image = self.parse_batch_calibration(batch)
+            image_features = self.model_teacher.image_encoder(image.type(self.model_teacher.dtype))
+            image_features = F.normalize(image_features.float(), dim=-1, eps=eps)
+
+            remaining = max_samples - num_samples
+            if image_features.shape[0] > remaining:
+                image_features = image_features[:remaining]
+
+            if not torch.isfinite(image_features).all():
+                raise RuntimeError("Calibration features contain NaN or Inf")
+
+            features.append(image_features.detach().cpu())
+            num_samples += image_features.shape[0]
+            num_batches += 1
+
+        if not features:
+            raise RuntimeError("No images were collected for automatic calibration")
+
+        return torch.cat(features, dim=0).float(), num_batches
+
+    def _auto_calibration_cache_path(self):
+        filename = self.cfg.TRAINER.PROMPTKD.AUTO_CALIBRATION_FILENAME
+        output_dir = self.cfg.OUTPUT_DIR if self.cfg.OUTPUT_DIR else "."
+        return osp.join(output_dir, filename)
+
+    def _build_auto_calibration_metadata(self, candidate_space, scoring_class_range):
+        cfg_kd = self.cfg.TRAINER.PROMPTKD
+        templates = self.get_prompt_templates() if cfg_kd.USE_MULTI_TEMPLATE_TEXT else []
+        return {
+            "dataset": self.cfg.DATASET.NAME,
+            "modal": self.cfg.TRAINER.MODAL,
+            "seed": int(self.cfg.SEED),
+            "teacher_name": cfg_kd.TEACHER_NAME,
+            "num_classes": int(self.n_cls),
+            "candidate_space": {
+                "mtp_alpha": [float(v) for v in candidate_space["mtp_alpha"]],
+                "dvp_alpha": [float(v) for v in candidate_space["dvp_alpha"]],
+                "prior_gamma": [float(v) for v in candidate_space["prior_gamma"]],
+            },
+            "scoring_class_range": list(scoring_class_range),
+            "anchor_weight": float(cfg_kd.AUTO_CALIBRATION_ANCHOR_WEIGHT),
+            "shift_weight": float(cfg_kd.AUTO_CALIBRATION_SHIFT_WEIGHT),
+            "mtp_template_set": str(cfg_kd.MTP_TEMPLATE_SET),
+            "mtp_custom_templates_hash": stable_hash(str(cfg_kd.MTP_CUSTOM_TEMPLATES)),
+            "mtp_templates_hash": stable_hash(templates),
+            "mtp_normalize_each_template": bool(cfg_kd.MTP_NORMALIZE_EACH_TEMPLATE),
+            "dvp_cache_version": DVP_CACHE_VERSION,
+            "dvp_hard": bool(cfg_kd.DVP_HARD),
+            "dvp_topk": int(cfg_kd.DVP_TOPK),
+            "dvp_min_mass": float(cfg_kd.DVP_MIN_MASS),
+            "prior_temperature": float(cfg_kd.PRIOR_TEMPERATURE),
+        }
+
+    def _apply_auto_calibration_selection(self, selected):
+        self.selected_mtp_alpha = float(selected["mtp_alpha"])
+        self.selected_dvp_alpha = float(selected["dvp_alpha"])
+        self.selected_prior_gamma = float(selected["prior_gamma"])
+        self.auto_calibration_success = True
+
+    def _log_auto_calibration_selection(self, selected, fallback):
+        print("[PromptKD][AutoCalibration] selected:")
+        print(f"MTP_ALPHA={selected['mtp_alpha']}")
+        print(f"DVP_ALPHA={selected['dvp_alpha']}")
+        print(f"PRIOR_GAMMA={selected['prior_gamma']}")
+        print(f"score={selected['score']}")
+        print(f"MI={selected['mi_norm']}")
+        print(f"JS={selected['js_norm']}")
+        print(f"shift={selected['shift_norm']}")
+        print(
+            "[PromptKD][AutoCalibration] fallback: "
+            f"MTP_ALPHA={fallback.mtp_alpha}, "
+            f"DVP_ALPHA={fallback.dvp_alpha}, "
+            f"PRIOR_GAMMA={fallback.prior_gamma}"
+        )
+
+    def maybe_run_auto_calibration(self, raw_text_features, mtp_text_features, visual_prototypes, dvp_available):
+        cfg_kd = self.cfg.TRAINER.PROMPTKD
+        self.auto_calibration_success = False
+        self.auto_calibration_result = None
+        self.auto_calibration_teacher_prior = None
+        self.selected_mtp_alpha = None
+        self.selected_dvp_alpha = None
+        self.selected_prior_gamma = None
+
+        if not cfg_kd.AUTO_CALIBRATE:
+            self._log_auto_calibration_disabled()
+            return
+
+        fallback = self._configured_fallback()
+        print("[PromptKD][AutoCalibration] enabled=True")
+        print(f"[PromptKD][AutoCalibration] method={cfg_kd.AUTO_CALIBRATION_METHOD}")
+
+        try:
+            candidate_space = resolve_candidate_space(
+                cfg_kd.AUTO_CALIBRATION_MTP_CANDIDATES,
+                cfg_kd.AUTO_CALIBRATION_DVP_CANDIDATES,
+                cfg_kd.AUTO_CALIBRATION_PRIOR_CANDIDATES,
+                fallback,
+                mtp_enabled=bool(cfg_kd.USE_MULTI_TEMPLATE_TEXT and mtp_text_features is not None),
+                dvp_enabled=bool(cfg_kd.DVP_ENABLE and dvp_available),
+                prior_enabled=bool(cfg_kd.PRIOR_CORRECT),
+                warn_fn=self._auto_warn,
+            )
+
+            scoring_slice, scoring_num_classes = get_scoring_class_slice(
+                self.cfg.TRAINER.MODAL,
+                bool(cfg_kd.AUTO_CALIBRATION_USE_BASE_CLASSES_ONLY),
+                self.n_cls,
+            )
+            metadata = self._build_auto_calibration_metadata(
+                candidate_space,
+                [scoring_slice.start, scoring_slice.stop],
+            )
+            cache_path = self._auto_calibration_cache_path()
+
+            if (
+                cfg_kd.AUTO_CALIBRATION_CACHE
+                and osp.exists(cache_path)
+                and not cfg_kd.AUTO_CALIBRATION_RECOMPUTE
+            ):
+                cached = load_cached_calibration_json(cache_path, metadata, warn_fn=self._auto_warn)
+                if cached is not None:
+                    self._apply_auto_calibration_selection(cached["selected"])
+                    self.auto_calibration_result = cached
+                    print(f"[PromptKD][AutoCalibration] Loaded cached calibration result from {cache_path}")
+                    self._log_auto_calibration_selection(cached["selected"], fallback)
+                    return
+
+            calibration_seed = int(self.cfg.SEED) if int(self.cfg.SEED) >= 0 else 0
+            with preserved_rng(calibration_seed):
+                image_features, num_batches = self.collect_unlabeled_calibration_features()
+
+            num_samples = int(image_features.shape[0])
+            num_combinations = (
+                len(candidate_space["mtp_alpha"])
+                * len(candidate_space["dvp_alpha"])
+                * len(candidate_space["prior_gamma"])
+            )
+            print(f"[PromptKD][AutoCalibration] calibration samples={num_samples}")
+            print(f"[PromptKD][AutoCalibration] scoring classes={scoring_num_classes}")
+            print(f"[PromptKD][AutoCalibration] candidate combinations={num_combinations}")
+
+            logit_scale = self.model_teacher.logit_scale.exp().detach().float().cpu()
+            search_result = search_calibration_parameters(
+                image_features=image_features,
+                raw_text_features=raw_text_features.detach().cpu().float(),
+                visual_prototypes=visual_prototypes.detach().cpu().float() if visual_prototypes is not None else None,
+                mtp_text_features=mtp_text_features.detach().cpu().float() if mtp_text_features is not None else None,
+                logit_scale=logit_scale,
+                candidate_space=candidate_space,
+                fallback=fallback,
+                modal=self.cfg.TRAINER.MODAL,
+                use_base_classes_only=bool(cfg_kd.AUTO_CALIBRATION_USE_BASE_CLASSES_ONLY),
+                prior_temperature=float(cfg_kd.PRIOR_TEMPERATURE),
+                anchor_weight=float(cfg_kd.AUTO_CALIBRATION_ANCHOR_WEIGHT),
+                shift_weight=float(cfg_kd.AUTO_CALIBRATION_SHIFT_WEIGHT),
+                eps=float(cfg_kd.AUTO_CALIBRATION_EPS),
+            )
+
+            selected = search_result["selected"]
+            if not math.isfinite(float(selected["score"])):
+                raise RuntimeError("All calibration candidate scores are invalid")
+
+            self._apply_auto_calibration_selection(selected)
+            self.auto_calibration_teacher_prior = search_result.get("selected_prior")
+            payload = make_calibration_payload(
+                metadata=metadata,
+                fallback=fallback,
+                candidate_space=candidate_space,
+                objective={
+                    "anchor_weight": float(cfg_kd.AUTO_CALIBRATION_ANCHOR_WEIGHT),
+                    "shift_weight": float(cfg_kd.AUTO_CALIBRATION_SHIFT_WEIGHT),
+                },
+                selected=selected,
+                baseline=search_result["baseline"],
+                all_results=search_result["all_results"],
+                num_calibration_samples=num_samples,
+                num_calibration_batches=num_batches,
+                scoring_num_classes=search_result["scoring_num_classes"],
+            )
+            self.auto_calibration_result = payload
+
+            if cfg_kd.AUTO_CALIBRATION_CACHE:
+                save_calibration_json(cache_path, payload)
+                print(f"[PromptKD][AutoCalibration] Saved calibration result to {cache_path}")
+
+            self._log_auto_calibration_selection(selected, fallback)
+        except Exception as exc:
+            self.auto_calibration_success = False
+            self.auto_calibration_teacher_prior = None
+            self._log_auto_calibration_fallback(str(exc))
 
     def _get_eval_loader(self, split):
         if split == "val" and self.val_loader is not None:
@@ -928,13 +1292,24 @@ class PromptKD(TrainerX):
         self._warning_once_cache = set()
         self._text_calibration_diag = None
         self.teacher_text_model = None
+        self.raw_teacher_text_features = None
+        self.mtp_text_features = None
         self.dvp_text_features = None
+        self.dvp_base_text_features = None
+        self.dvp_visual_prototypes = None
         self.dvp_cache_path = None
         self.dvp_loaded_from_cache = False
         self.dvp_mass = None
         self.dvp_fallback_mask = None
+        self.dvp_force_disabled = False
         self.teacher_class_prior = None
         self.prior_cache_path = None
+        self.auto_calibration_success = False
+        self.auto_calibration_result = None
+        self.auto_calibration_teacher_prior = None
+        self.selected_mtp_alpha = None
+        self.selected_dvp_alpha = None
+        self.selected_prior_gamma = None
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -976,20 +1351,72 @@ class PromptKD(TrainerX):
         self.model_teacher.load_state_dict(state_dict, strict=False)
         self.model_teacher.to(self.device)
         self.model_teacher.eval()
+        for param in self.model_teacher.parameters():
+            param.requires_grad_(False)
+
+        self.raw_teacher_text_features = self.get_raw_teacher_text_features().to(self.device).detach()
+        self.raw_teacher_text_features.requires_grad_(False)
+
+        if cfg.TRAINER.PROMPTKD.USE_MULTI_TEMPLATE_TEXT:
+            classnames = self.get_current_classnames()
+            mtp_features = self.build_multi_template_text_features(classnames, self.device)
+            mtp_features = self._align_text_feature_shape(mtp_features, self.raw_teacher_text_features)
+            if mtp_features is not None:
+                self.mtp_text_features = mtp_features.to(self.device).detach()
+                self.mtp_text_features.requires_grad_(False)
+            else:
+                self._auto_warn("MTP feature construction failed; MTP candidates will be forced to 0.")
+
+        dvp_available = False
+        if cfg.TRAINER.PROMPTKD.DVP_ENABLE:
+            try:
+                if cfg.TRAINER.PROMPTKD.AUTO_CALIBRATE:
+                    calibration_seed = int(cfg.SEED) if int(cfg.SEED) >= 0 else 0
+                    with preserved_rng(calibration_seed):
+                        dvp_result = self.build_domain_visual_prototypes()
+                else:
+                    dvp_result = self.build_domain_visual_prototypes()
+                self.dvp_base_text_features = dvp_result["base_text_features"].to(self.device).detach()
+                self.dvp_visual_prototypes = dvp_result["visual_prototypes"].to(self.device).detach()
+                self.dvp_base_text_features.requires_grad_(False)
+                self.dvp_visual_prototypes.requires_grad_(False)
+                self.dvp_cache_path = dvp_result["cache_path"]
+                self.dvp_loaded_from_cache = dvp_result["loaded_from_cache"]
+                self.dvp_mass = dvp_result["mass"].float()
+                self.dvp_fallback_mask = dvp_result["fallback_mask"].bool()
+                dvp_available = True
+            except Exception as exc:
+                if cfg.TRAINER.PROMPTKD.AUTO_CALIBRATE:
+                    self.dvp_force_disabled = True
+                    self.dvp_base_text_features = self.raw_teacher_text_features
+                    self.dvp_visual_prototypes = self.raw_teacher_text_features
+                    self.dvp_mass = torch.zeros(self.n_cls, dtype=torch.float32)
+                    self.dvp_fallback_mask = torch.ones(self.n_cls, dtype=torch.bool)
+                    self._auto_warn(f"DVP prototype construction failed; DVP_ALPHA is forced to 0. Reason: {exc}")
+                else:
+                    raise
+
+        self.maybe_run_auto_calibration(
+            raw_text_features=self.raw_teacher_text_features,
+            mtp_text_features=self.mtp_text_features,
+            visual_prototypes=self.dvp_visual_prototypes,
+            dvp_available=dvp_available,
+        )
 
         if cfg.TRAINER.PROMPTKD.DVP_ENABLE:
-            dvp_result = self.build_domain_visual_prototypes()
-            self.dvp_text_features = dvp_result["fused_text_features"].to(self.device).detach()
-            self.dvp_text_features.requires_grad_(False)
-            self.dvp_cache_path = dvp_result["cache_path"]
-            self.dvp_loaded_from_cache = dvp_result["loaded_from_cache"]
-            self.dvp_mass = dvp_result["mass"].float()
-            self.dvp_fallback_mask = dvp_result["fallback_mask"].bool()
+            if self.dvp_visual_prototypes is not None:
+                self.dvp_text_features = fuse_dvp_text_features(
+                    self.raw_teacher_text_features,
+                    self.dvp_visual_prototypes,
+                    self.get_dvp_alpha(),
+                    eps=float(cfg.TRAINER.PROMPTKD.DVP_EPS),
+                ).to(self.device).detach()
+                self.dvp_text_features.requires_grad_(False)
 
             mass = self.dvp_mass
             fallback_count = int(self.dvp_fallback_mask.sum().item())
             print(
-                f"DVP enabled: alpha={cfg.TRAINER.PROMPTKD.DVP_ALPHA}, "
+                f"DVP enabled: alpha={self.get_dvp_alpha()}, "
                 f"hard={cfg.TRAINER.PROMPTKD.DVP_HARD}, "
                 f"topk={cfg.TRAINER.PROMPTKD.DVP_TOPK}"
             )
